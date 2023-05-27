@@ -12,17 +12,21 @@ use App\Http\Utility\Cosmic\Rules\Icmp;
 use App\Http\Utility\Cosmic\Rules\Tcp;
 use App\Http\Utility\Cosmic\Rules\Udp;
 use App\Http\Utility\Cosmic\Wrapper;
+use App\Models\FirewallLocking;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use App\Http\Utility\Cosmic\Filters\Raknet;
 use App\Http\Utility\Cosmic\Filters\Gmod;
 use App\Http\Utility\Cosmic\Filters\Samp;
 use App\Http\Utility\Cosmic\Filters\Ddnet;
+use Illuminate\Support\Facades\Redis;
 
 class ApiFirewallController extends Controller
 {
     private static string $API_KEY = "";
-    private static $api_key_to_ips_map = array();
+    private static $api_key_to_ips_map = array(
+	'exampleKEYgoesHERE123' => '1.1.1.2-1.1.1.5;9.69.9.69-10.69.10.69',
+    );
 
     private function authorized($ip_address, $api_key): bool
     {
@@ -42,8 +46,8 @@ class ApiFirewallController extends Controller
             foreach($ranges as $range)
             {
                 $map_split = explode("-", $range);
-                $first_starter = explode(".", $map_split[0])[3];
-                $last_finisher = explode(".", $map_split[1])[3];
+                $first_starter = explode(".", $map_split[0])[3]; // first digit of the last octet of the IP... e.g., 207.174.40.1
+                $last_finisher = explode(".", $map_split[1])[3]; // last digit of the last octet of the IP... e.g., 207.174.40.128
                 $authorized_ips = array();
                 $exploder = explode(".", $map_split[0]);
                 for($i = $first_starter; $i < $last_finisher+1; $i++)
@@ -58,10 +62,24 @@ class ApiFirewallController extends Controller
         return false;
     }
 
+    public function preset_list(Request $request)
+    {
+        return json_encode(
+            array(
+                '1' => 'cpanel',
+                '2' => 'directadmin',
+                '3' => 'general-http-server',
+                '4' => 'windows-rdp',
+                '5' => 'special-fivem-experimental'
+            )
+        );
+    }
+
     public function preset(Request $request, $ip_address, $preset_id)
     {
         $api_key = $request->header('X-Auth-Token');
         if(!$this->authorized($ip_address, $api_key)) abort(403);
+        if($this->isLocked($ip_address)) abort(403);
         $wrapper = new Wrapper(self::$API_KEY);
         $wrapper->deleteAllRules($ip_address);
         // Some generic rules
@@ -175,10 +193,42 @@ class ApiFirewallController extends Controller
         return json_encode($wrapper->listRules($ip_address));
     }
 
+    private function isLocked(string $ip_address): bool
+    {
+        $lock_query = FirewallLocking::query()->where('ipv4_address', '=', $ip_address)->first();
+        if($lock_query) {
+            return $lock_query->locked;
+        }
+        return false;
+    }
+
+    private function toggleLock(string $ip_address): void
+    {
+        $lock_query = FirewallLocking::query()->where('ipv4_address', '=', $ip_address)->first();
+        if($lock_query) {
+            $lock_query->locked = !$lock_query->locked;
+            $lock_query->save();
+            return;
+        }
+        $lock_query = new FirewallLocking();
+        $lock_query->ipv4_address = $ip_address;
+        $lock_query->locked = true;
+        $lock_query->save();
+    }
+
+    public function lock(Request $request, string $ip_address)
+    {
+        $api_key = $request->header('X-Auth-Token');
+        if(!$this->authorized($ip_address, $api_key)) abort(403);
+        $this->toggleLock($ip_address);
+        return json_encode(['state' => 'ok']);
+    }
+
     public function add(Request $request, $ip_address, $udp_port = 0, $tcp_port = 0, $protocol = "tcp", $mode = "pass", $src_ip = null) // default pass
     {
         $api_key = $request->header('X-Auth-Token');
         if(!$this->authorized($ip_address, $api_key)) abort(403);
+        if($this->isLocked($ip_address)) abort(403);
         $wrapper = new Wrapper(self::$API_KEY);
         if($protocol == Wrapper::$protocols["icmp"]) {
             $rule = new Icmp($mode);
@@ -190,6 +240,9 @@ class ApiFirewallController extends Controller
         if($mode == "fivem") {
             // this is a FiveM server, let's address it
             $fivem = new Fivem($udp_port, $tcp_port);
+            if($request->get('experimental', false)) {
+                $fivem->flag('experimental', $request->get('experimental', false));
+            }
             $wrapper->stageNewRule($fivem);
             $wrapper->upsertRules($ip_address, true);
             return json_encode(['state' => 'ok']);
@@ -277,6 +330,7 @@ class ApiFirewallController extends Controller
     {
         $api_key = $request->header('X-Auth-Token');
         if(!$this->authorized($ip_address, $api_key)) abort(403);
+        if($this->isLocked($ip_address)) abort(403);
         $wrapper = new Wrapper(self::$API_KEY);
         if($udp_port != 0) {
             $wrapper->deleteRule($ip_address, $udp_port, $protocol, false, $src_ip);
@@ -302,6 +356,7 @@ class ApiFirewallController extends Controller
     {
         $api_key = $request->header('X-Auth-Token');
         if(!$this->authorized($ip_address, $api_key)) abort(403);
+        if($this->isLocked($ip_address)) abort(403);
         $wrapper = new Wrapper(self::$API_KEY);
         return $wrapper->execRaw($ip_address, $request->get('raw_input'));
     }
